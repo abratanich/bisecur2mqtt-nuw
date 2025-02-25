@@ -8,13 +8,6 @@ bisecur_ip     = 'bisecuregateway'
 bisecur_mac    = 'XX:XX:XX:XX:XX:XX'
 src_mac        = 'FF:FF:FF:FF:FF:FF'
 
-# Port numbers for the door related actions
-impulse_port    = 0
-up_port         = 3
-down_port       = 4
-partial_port    = 2
-light_port      = 1
-
 # MQTT broker 
 mqtt_broker     = '172.16.2.31'
 mqtt_port       = 1883              # default: 1883
