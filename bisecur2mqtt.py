@@ -1,7 +1,8 @@
 import os
+import re
 import sys
 import logging as log
-import paho.mqtt.client as paho   # pip install paho-mqtt
+import paho.mqtt.client as paho  # pip install paho-mqtt
 import time
 from datetime import datetime
 import socket
@@ -12,12 +13,13 @@ import threading
 
 from pysecur3.client import MCPClient
 from pysecur3.MCP import MCPGenericCommand
+from pysecur3.MCP import MCPSetState
 
-VERSION= "0.7.2"
-DEBUG=False
+VERSION = "0.7.2"
+DEBUG = False
 
+CONFIG = os.getenv('BISECUR2MQTT_CONFIG', 'bisecur2mqtt.conf')
 
-CONFIG=os.getenv('BISECUR2MQTT_CONFIG', 'bisecur2mqtt.conf')
 
 class Config(object):
     def __init__(self, filename=CONFIG):
@@ -27,16 +29,18 @@ class Config(object):
     def get(self, key, default=None):
         return self.config.get(key, default)
 
+
 try:
     config = Config()
 except Exception as e:
     print("Cannot load configuration from file {}: {}".format(CONFIG, str(e)))
     sys.exit(2)
 
-
 MQTT_TOPIC_BASE = config.get("mqtt_topic_base", "bisecur2mqtt")
 MQTT_COMMAND_SUBTOPIC = "send_command"
-MQTT_QOS=0
+MQTT_QOS = 0
+
+DOORS_PORT = [0, 1]
 
 MQTT_CLIENT_SUB = None
 MQTT_CLIENT_PUB = None
@@ -46,14 +50,14 @@ LAST_DOOR_STATE = None
 POS_TRACKING_THREAD = None
 DO_EXIT_THREAD = False
 
-MAX_RETRIES = 2
+MAX_RETRIES = 10
 
 CMD_GET_TYPE = 49
 CMD_GET_STATE = 50
 CMD_SET_STATE = 51
 
 LOGFILE = config.get('logfile', 'bisecur2mqtt.log')
-#LOGFORMAT = '%(asctime)-15s %(funcName).10s %(message)s'
+# LOGFORMAT = '%(asctime)-15s %(funcName).10s %(message)s'
 LOGFORMAT = "%(asctime)10s [%(filename)s:%(lineno)3s]  %(message)s [%(funcName)s()]"
 
 if DEBUG:
@@ -61,31 +65,25 @@ if DEBUG:
 else:
     log.basicConfig(filename=LOGFILE, level=log.INFO, format=LOGFORMAT)
 
-stderrLogger=log.StreamHandler()
+stderrLogger = log.StreamHandler()
 stderrLogger.setFormatter(log.Formatter(LOGFORMAT))
 log.getLogger().addHandler(stderrLogger)
-
 
 log.info("Starting")
 log.debug("DEBUG MODE")
 
 
-def do_command(cmd):
+def do_command(cmd, set_door=None):
     cmd = cmd.lower().strip()
     publish_to_mqtt(f"{MQTT_COMMAND_SUBTOPIC}/command", datetime.now().strftime("%Y-%m-%dT%H:%M:%S"), ts_only=True)
-
-    # Generic Commands:
-    # 	GET_TYPE = 49, GET_STATE = 50, SET_STATE = 51
-    # Port Types:   IMPULS(1), UP(4), DOWN(5), HALF(6), LIGHT(8),
-
     resp = None
     try:
-        if cmd in "get_door_state get_door_position" :
-            resp, _, _ = get_door_status()
+        if cmd in "get_door_state get_door_position":
+            resp, _, _ = get_door_status(set_door)
 
         elif cmd in "up down open close stop impulse partial light":
             sanitised_cmd = cmd.replace("open", "up").replace("close", "down")
-            resp = do_door_action(sanitised_cmd)
+            resp = do_door_action(sanitised_cmd, set_door)
 
         elif cmd == "get_ports":
             resp = get_ports()
@@ -103,7 +101,7 @@ def do_command(cmd):
             resp = (f"Command '{cmd} is not recognised")
 
         check_mcp_error(resp)
-        publish_to_mqtt(f"{MQTT_COMMAND_SUBTOPIC}/response", resp)
+        publish_to_mqtt(f"{MQTT_COMMAND_SUBTOPIC}/{set_door}/response", resp)
 
     except Exception as ex:
         log.error(ex)
@@ -125,7 +123,8 @@ def publish_to_mqtt(topic, payload, topic_base=MQTT_TOPIC_BASE, qos=MQTT_QOS, re
                 MQTT_CLIENT_SUB.publish(f"{topic_base}/{topic}", payload, qos=qos, retain=retain)
 
             log.debug(f"---> MQTT pub: {topic_base}/{topic}_ts {datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}")
-            MQTT_CLIENT_SUB.publish(f"{topic_base}/{topic}_ts", datetime.now().strftime("%Y-%m-%dT%H:%M:%S"), qos=qos, retain=retain)
+            MQTT_CLIENT_SUB.publish(f"{topic_base}/{topic}_ts", datetime.now().strftime("%Y-%m-%dT%H:%M:%S"), qos=qos,
+                                    retain=retain)
         except Exception as ex:
             log.error(f"Error in topic: {topic}, payload: {payload}")
             log.error(ex)
@@ -148,11 +147,11 @@ def get_gw_version():
 
 
 def get_ports():
-    cmd_mcp = {"CMD":"GET_GROUPS", "FORUSER":0}
+    cmd_mcp = {"CMD": "GET_GROUPS", "FORUSER": 0}
     try:
         resp = CLI.jcmp(cmd_mcp)
         ports = resp.payload.payload
-        ports = ast.literal_eval(ports.decode("utf-8")) # convert from binary
+        ports = ast.literal_eval(ports.decode("utf-8"))  # convert from binary
 
         log.info(f"Ports for user 0: {json.dumps(ports, indent=4, sort_keys=True)}")
         publish_to_mqtt("attributes/user0_ports", json.dumps(ports))
@@ -172,54 +171,48 @@ def check_broken_pipe(err_msg):
         return False
 
 
-def get_door_status():
+def get_door_status(set_door):
+    set_door = int(set_door)
     retries = 0
     while retries < MAX_RETRIES:
         try:
-            resp = CLI.get_transition(impulse_port)
-            #if resp.payload.command.error_code.value == 10: # PORT_ERROR
-
+            resp = CLI.get_transition(set_door)
             state = None
-            if resp and resp.payload and hasattr(resp.payload.command , "percent_open"):
+            if resp and resp.payload and hasattr(resp.payload.command, "percent_open"):
                 position = resp.payload.command.percent_open
                 if position == 0:
                     state = "closed"
-                    log.info("Garage door is CLOSED")
+                    log.info(f"---> Garage door {set_door} is CLOSED <----")
                 elif position == 100:
                     state = "open"
-                    log.info("Garage door is OPEN")
+                    log.info(f"---> Garage door {set_door} is OPEN <----")
                 else:
-                    log.info(f"Garage door is {resp.payload.command.percent_open}% OPEN")
+                    log.info(f"Garage door {set_door} is {resp.payload.command.percent_open}% OPEN")
             else:
                 position = -1
                 log.warning(f"get_transition response has no 'percentage_open' attribute (resp: {resp})")
-
-            # log.info(f"posting position {position} and state {state} to MQTT....")
-            publish_to_mqtt("garage_door/position", position)
+            log.info(f"posting position {position} and state {state} to MQTT....")
+            publish_to_mqtt(f"garage_door/{set_door}/position", position)
             if state:
-                publish_to_mqtt("garage_door/state", state)
-
+                publish_to_mqtt(f"garage_door/{set_door}/state", state)
             return resp, position, state
         except Exception as ex:
             log.error(f"ERROR: {ex}")
             if DEBUG:
                 traceback.print_exc()
-
             if check_broken_pipe(str(ex).lower()):
                 break
-
             if CLI.last_error and retries < 5:
-                log.error(f"[ERROR] CLI error found {CLI.last_error}") #TODO!!!
-                time.sleep(.5)
+                log.error(f"[ERROR] CLI error found {CLI.last_error}")  # TODO!!!
+                time.sleep(.8)
                 retries += 1
             else:
                 break
-
     return None, -1, None
 
 
-def track_realtime_door_position(current_pos=None, last_action=None):
-    publish_to_mqtt("garage_door/position", current_pos)
+def track_realtime_door_position(current_pos=None, last_action=None, set_door=0):
+    publish_to_mqtt(f"garage_door/{set_door}/position", current_pos)
 
     global LAST_DOOR_STATE
     global DO_EXIT_THREAD
@@ -228,11 +221,11 @@ def track_realtime_door_position(current_pos=None, last_action=None):
     last_pos = None
 
     DO_EXIT_THREAD = False
-
-    while not DO_EXIT_THREAD and ((state != "open" and last_action == "up open") or (state != "closed" and last_action in "down close") or current_pos != last_pos):
-        time.sleep(1)
+    while not DO_EXIT_THREAD and ((state != "open" and last_action == "up open") or (
+            state != "closed" and last_action in "down close") or current_pos != last_pos):
+        time.sleep(2)
         last_pos = current_pos
-        resp, current_pos, state = get_door_status()
+        resp, current_pos, state = get_door_status(set_door)
         if resp is None:
             DO_EXIT_THREAD = True
             break
@@ -248,14 +241,15 @@ def track_realtime_door_position(current_pos=None, last_action=None):
             else:
                 state = "unknown"
             LAST_DOOR_STATE = state
-            publish_to_mqtt("garage_door/position", current_pos)
-            publish_to_mqtt("garage_door/state", state)
+            publish_to_mqtt(f"garage_door/{set_door}/position", current_pos)
+            publish_to_mqtt(f"garage_door/{set_door}/state", state)
     LAST_DOOR_STATE = state
     return LAST_DOOR_STATE
 
 
-def do_door_action(action):
+def do_door_action(action, set_door):
     global LAST_DOOR_STATE
+    value = None
     if action == "stop":
         # Do reverse action to stop current direction
         if LAST_DOOR_STATE == "opening":
@@ -267,17 +261,14 @@ def do_door_action(action):
             log.warning(log_msg)
             return log_msg
 
-    if (action in "impulse up down partial light" and f"{action}_port" in globals()) or action == "stop":
+    if action in "impulse up down partial light stop":
         try:
-            port = globals()[f"{action}_port"]
-            value = port << 8 | 0xFF
-            mcp_cmd = MCPGenericCommand.construct(CMD_SET_STATE, value)
+            port = int(set_door)
+            mcp_cmd = MCPSetState.construct(port)
             action_resp = CLI.generic(mcp_cmd, False)
-
             if not check_mcp_error(action_resp):
-                current_pos = action_resp.payload.command.percent_open if hasattr(action_resp.payload.command, "percent_open")  else -1
-                # publish_to_mqtt("garage_door/response", str(action_resp.payload.command))
-
+                current_pos = action_resp.payload.command.percent_open if hasattr(action_resp.payload.command,
+                                                                                  "percent_open") else -1
                 global POS_TRACKING_THREAD
                 if POS_TRACKING_THREAD and POS_TRACKING_THREAD.is_alive():
                     global DO_EXIT_THREAD
@@ -290,14 +281,13 @@ def do_door_action(action):
                         time.sleep(.5)
                         counter += 0.5
                 if POS_TRACKING_THREAD: log.debug(f"----> POS_TRACKING_THREAD.is_alive: {POS_TRACKING_THREAD.is_alive()}")
-
-                POS_TRACKING_THREAD = threading.Thread(name='pos_tracking_thread', target=track_realtime_door_position, args=(current_pos, action,))
+                POS_TRACKING_THREAD = threading.Thread(
+                    name='pos_tracking_thread',
+                    target=track_realtime_door_position,
+                    args=(current_pos, action, set_door)
+                )
                 POS_TRACKING_THREAD.start()
                 log.debug(f"New thread spawned for 'do_command': {POS_TRACKING_THREAD}")
-
-
-                # track_realtime_door_position(current_pos, action)
-
             return action_resp
         except Exception as ex:
             log.error(f"ERROR: {ex}")
@@ -308,10 +298,10 @@ def do_door_action(action):
         log.error(f"Port '{action}_port' is not defined in")
         return None
 
+
 def do_gw_login():
     bisecur_user = config.get("bisecur_user")
     bisecur_pw = config.get("bisecur_pw")
-
     log.debug(f"INIT: Logging in to Bisecur Gateway as user '{bisecur_user}'")
     CLI.login(bisecur_user, bisecur_pw)
     if CLI.token:
@@ -323,16 +313,21 @@ def do_gw_login():
 
 
 def check_mcp_error(resp):
-    if CLI.last_error: #TODO!!! Tidy up...
+    if CLI.last_error:  # TODO!!! Tidy up...
         log.error(f"--- 1. CLI.last_error: {CLI.last_error}")
-        if hasattr(resp, "payload") and hasattr(resp.payload, "command") and hasattr(resp.payload.command, "error_code"):
-            error_obj = {"error_code": resp.payload.command.error_code.value, "error": resp.payload.command.error_code.name}
+        if hasattr(resp, "payload") and hasattr(resp.payload, "command") and hasattr(resp.payload.command,
+                                                                                     "error_code"):
+            error_obj = {"error_code": resp.payload.command.error_code.value,
+                         "error": resp.payload.command.error_code.name}
         else:
             error_obj = {"error_code": "Unknown", "error": str(resp) if resp else "Unknown error"}
         publish_to_mqtt(f"{MQTT_COMMAND_SUBTOPIC}/error", json.dumps(error_obj))
 
-    elif resp and hasattr(resp, "resp.payload") and hasattr(resp, "resp.payload.command_id") and resp.payload.command_id == 1 and hasattr(resp.payload.command, "error_code"):
-        log.error(f"MCP error '{resp.payload.command.error_code.value}' occurred (code: {resp.payload.command.error_code.name}) ")
+    elif resp and hasattr(resp, "resp.payload") and hasattr(resp,
+                                                            "resp.payload.command_id") and resp.payload.command_id == 1 and hasattr(
+            resp.payload.command, "error_code"):
+        log.error(
+            f"MCP error '{resp.payload.command.error_code.value}' occurred (code: {resp.payload.command.error_code.name}) ")
         # Error 12 is Permission Denied
         # CLI.last_error = resp.payload.command.error_code
         log.error(f"--- 2. CLI.last_error: {CLI.last_error}")
@@ -345,37 +340,56 @@ def check_mcp_error(resp):
         # CLI.last_error = None
         return None
 
+
 def on_message(mosq, userdata, msg):
     log.info(f"---> Topic '{msg.topic}' received command '{msg.payload.decode('utf-8')}'")
     cmd = msg.payload.decode('utf-8')
-    do_command(cmd)
+    parts = cmd.split("_")
+    if re.match(r"^[a-zA-Z]+_\d+$", cmd):
+        log.info(f"Door: {parts[1]} and Command: {parts[0]}")
+        do_command(parts[0], parts[1])
+    else:
+        log.warning(f"Received invalid command format: {cmd}")
 
 
 def on_connect(mosq, userdata, flags, result_code):
-    sub_topic = f"{MQTT_TOPIC_BASE}/{MQTT_COMMAND_SUBTOPIC}/command"
-    log.info(f"Connected to MQTT broker. Subscribing to '{sub_topic}'")
-    MQTT_CLIENT_SUB.subscribe(sub_topic, MQTT_QOS)
-    publish_to_mqtt("state", "online")
-    init_ha_discovery()
-
+    for set_door in DOORS_PORT:
+        sub_topic = f"{MQTT_TOPIC_BASE}/{MQTT_COMMAND_SUBTOPIC}/command"
+        log.info(f"Connected to MQTT broker. Subscribing to '{sub_topic}' door: {set_door}")
+        MQTT_CLIENT_SUB.subscribe(sub_topic, MQTT_QOS)
+        publish_to_mqtt(f"{set_door}/state", "online")
+        init_ha_discovery(set_door)
 
 def on_disconnect(mosq, userdata, rc):
-    publish_to_mqtt("state", "offline")
     log.info("MQTT session disconnected")
+    for set_door in DOORS_PORT:
+        publish_to_mqtt(f"{set_door}/state", "offline")
+        log.info(f"Performing actions for port: {set_door}")
     time.sleep(10)
 
 
-def init_ha_discovery():
-    payload = {"door_commands_list":["impulse","up","down","partial","stop","light"],"json_attributes_topic":f"{MQTT_TOPIC_BASE}/attributes","name":"Bisecur Gateway: Garage Door","schema":"state","supported_features":["impulse","up","down","partial","stop","light","get_door_state","get_ports","login","sys_reset"],"availability_topic":f"{MQTT_TOPIC_BASE}/state","payload_available":"online","payload_not_available":"offline","unique_id":"bs_garage_door","device_class":"garage","payload_close":"down","payload_open":"up","payload_stop":"impulse","position_open":100.0,"position_closed":0.0,"position_topic":f"{MQTT_TOPIC_BASE}/garage_door/position","state_topic":f"{MQTT_TOPIC_BASE}/garage_door/state","command_topic":f"{MQTT_TOPIC_BASE}/{MQTT_COMMAND_SUBTOPIC}/command"}
-    bisecur_mac = config.get("bisecur_mac", "").replace(':','')
+def init_ha_discovery(set_door):
+    payload = {"door_commands_list": ["impulse", "up", "down", "partial", "stop", "light"],
+               "json_attributes_topic": f"{MQTT_TOPIC_BASE}/{set_door}/attributes",
+               "name": "Bisecur Gateway: Garage Door",
+               "schema": "state",
+               "supported_features": ["impulse", "up", "down", "partial", "stop", "light", "get_door_state",
+                                      "get_ports", "login", "sys_reset"],
+               "availability_topic": f"{MQTT_TOPIC_BASE}/{set_door}/state", "payload_available": "online",
+               "payload_not_available": "offline", "unique_id": "bs_garage_door", "device_class": "garage",
+               "payload_close": "down", "payload_open": "up", "payload_stop": "impulse", "position_open": 100.0,
+               "position_closed": 0.0, "position_topic": f"{MQTT_TOPIC_BASE}/{set_door}/garage_door/position",
+               "state_topic": f"{MQTT_TOPIC_BASE}/{set_door}/garage_door/state",
+               "command_topic": f"{MQTT_TOPIC_BASE}/{MQTT_COMMAND_SUBTOPIC}/command"}
+    bisecur_mac = config.get("bisecur_mac", "").replace(':', '')
     bisecur_ip = config.get("bisecur_ip", None)
     payload["connections"] = ["mac", bisecur_mac, "ip", bisecur_ip]
     payload["sw_version"] = VERSION
     _, payload["gw_hw_version"] = get_gw_version()
 
     mqtt_topic_HA_discovery = config.get("mqtt_topic_HA_discovery", "homeassistant")
-    publish_to_mqtt("cover/bisecur/config", json.dumps(payload), f"{mqtt_topic_HA_discovery}" )
-    publish_to_mqtt("attributes/system_version", VERSION )
+    publish_to_mqtt(f"cover/bisecur/{set_door}/config", json.dumps(payload), f"{mqtt_topic_HA_discovery}")
+    publish_to_mqtt("attributes/system_version", VERSION)
     publish_to_mqtt("attributes/gw_ip_address", bisecur_ip)
     publish_to_mqtt("attributes/gw_mac_address", bisecur_mac)
 
@@ -386,8 +400,8 @@ def init_bisecur_gw(is_restart=False):
         CLI.logout()
 
     # Init Bisecur Gateway stuff
-    src_mac = config.get("src_mac", "FF:FF:FF:FF:FF:FF").replace(':','')
-    bisecur_mac = config.get("bisecur_mac", "").replace(':','')
+    src_mac = config.get("src_mac", "FF:FF:FF:FF:FF:FF").replace(':', '')
+    bisecur_mac = config.get("bisecur_mac", "").replace(':', '')
     bisecur_ip = config.get("bisecur_ip", None)
     if not (bisecur_ip and bisecur_mac):
         log.error("ERROR: bisecur Gateway IP and MAC addresses must be specified in the config file")
@@ -414,16 +428,12 @@ if __name__ == '__main__':
     MQTT_CLIENT_SUB = paho.Client(f"{clientid}_sub", clean_session=False)
     MQTT_CLIENT_PUB = paho.Client(f"{clientid}_pub", clean_session=False)
 
-
-    MQTT_CLIENT_SUB.will_set(f"{MQTT_TOPIC_BASE}/state","offline", qos=0)
+    for set_door in DOORS_PORT:
+        MQTT_CLIENT_SUB.will_set(f"{MQTT_TOPIC_BASE}/{set_door}/state", "offline", qos=0)
 
     MQTT_CLIENT_SUB.on_message = on_message
     MQTT_CLIENT_SUB.on_connect = on_connect
     MQTT_CLIENT_SUB.on_disconnect = on_disconnect
-
-
-    # Delays will be: 3, 6, 12, 24, 30, 30, ...
-    #MQTT_CLIENT_SUB.reconnect_delay_set(delay=3, delay_max=30, exponential_backoff=True)
 
     if config.get('mqtt_username') is not None:
         MQTT_CLIENT_SUB.username_pw_set(config.get('mqtt_username'), config.get('mqtt_password'))
@@ -441,22 +451,10 @@ if __name__ == '__main__':
 
     if DEBUG:
         log.debug("Getting bisecur Gateway 'groups' for user 0...")
-        cmd = {"CMD":"GET_GROUPS", "FORUSER":0}
+        cmd = {"CMD": "GET_GROUPS", "FORUSER": 0}
         CLI.jcmp(cmd)
-
-    impulse_port    = config.get("impulse_port", None)
-    up_port         = config.get("up_port", None)
-    down_port       = config.get("down_port", None)
-    partial_port    = config.get("partial_port", None)
-    light_port      = config.get("light_port", None)
-
-    if impulse_port is None or not isinstance(impulse_port, int):
-        log.error("'Impulse' port number not found in configuration file")
-        sys.exit(2)
-
-    get_door_status()
-
-
+    for set_door in DOORS_PORT:
+        get_door_status(set_door)
     while True:
         try:
             MQTT_CLIENT_SUB.loop_forever()
@@ -467,16 +465,16 @@ if __name__ == '__main__':
             log.info("Shutting down connections")
         finally:
             log.info("Exiting system. Changing MQTT state to 'offline'")
-            MQTT_CLIENT_PUB.publish(f"{MQTT_TOPIC_BASE}/state", "offline")
+            for set_door in DOORS_PORT:
+                MQTT_CLIENT_PUB.publish(f"{MQTT_TOPIC_BASE}/{set_door}/state", "offline")
             MQTT_CLIENT_SUB.loop_stop()
             if CLI:
                 if hasattr(CLI, "last_error") and CLI.last_error is not None and "value" in CLI.last_error and CLI.last_error.value == 12:
-                    #Permission denined error (12) seems to make the system hang on receive
+                    # Permission denined error (12) seems to make the system hang on receive
                     log.info(f"Logging out of Bisecur Gateway ({CLI.token})")
                     CLI.logout()
                 elif hasattr(CLI, "last_error"):
                     log.debug(f"Pre-logout: Biscure last error: ({CLI.last_error})")
-
             log.info(f"Active threads: {threading.activeCount()}")
             log.debug("Tidying up spawned threads...")
             main_thread = threading.currentThread()
@@ -486,6 +484,5 @@ if __name__ == '__main__':
                     continue
                 log.info(f"...joining spawned thread '{t.getName()}'")
                 t.join()
-
             log.info("Done!")
             sys.exit(0)
