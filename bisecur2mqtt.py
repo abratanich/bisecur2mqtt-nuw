@@ -318,7 +318,6 @@ def check_mcp_error(resp):
         log.error(
             f"MCP error '{resp.payload.command.error_code.value}' occurred (code: {resp.payload.command.error_code.name}) ")
         # Error 12 is Permission Denied
-        # CLI.last_error = resp.payload.command.error_code
         log.error(f"--- 2. CLI.last_error: {CLI.last_error}")
         error_obj = {"error_code": resp.payload.command.error_code.value, "error": resp.payload.command.error_code.name}
         publish_to_mqtt(f"{MQTT_COMMAND_SUBTOPIC}/error", json.dumps(error_obj))
@@ -341,12 +340,12 @@ def on_message(mosq, userdata, msg):
 
 
 def on_connect(mosq, userdata, flags, result_code):
-    for set_door in DOORS_PORT:
-        publish_to_mqtt(f"{set_door}/state", "online")
-        init_ha_discovery(set_door)
     sub_topic = f"{MQTT_TOPIC_BASE}/{MQTT_COMMAND_SUBTOPIC}/command"
     log.info(f"Connected to MQTT broker. Subscribing to '{sub_topic}'")
     MQTT_CLIENT_SUB.subscribe(sub_topic, MQTT_QOS)
+    for set_door in DOORS_PORT:
+        publish_to_mqtt(f"{set_door}/state", "online")
+        init_ha_discovery(set_door)
 
 
 def on_disconnect(mosq, userdata, rc):
