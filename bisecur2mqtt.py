@@ -342,11 +342,11 @@ def on_message(mosq, userdata, msg):
 
 def on_connect(mosq, userdata, flags, result_code):
     for set_door in DOORS_PORT:
-        sub_topic = f"{MQTT_TOPIC_BASE}/{MQTT_COMMAND_SUBTOPIC}/command"
-        log.info(f"Connected to MQTT broker. Subscribing to '{sub_topic}' door: {set_door}")
-        MQTT_CLIENT_SUB.subscribe(sub_topic, MQTT_QOS)
         publish_to_mqtt(f"{set_door}/state", "online")
         init_ha_discovery(set_door)
+    sub_topic = f"{MQTT_TOPIC_BASE}/{MQTT_COMMAND_SUBTOPIC}/command"
+    log.info(f"Connected to MQTT broker. Subscribing to '{sub_topic}'")
+    MQTT_CLIENT_SUB.subscribe(sub_topic, MQTT_QOS)
 
 
 def on_disconnect(mosq, userdata, rc):
