@@ -2,20 +2,18 @@ import os
 import re
 import sys
 import logging as log
-import paho.mqtt.client as paho  # pip install paho-mqtt
+import paho.mqtt.client as paho
 import time
 from datetime import datetime
 import socket
 import json, ast
 import traceback
-
 import threading
 
 from pysecur3.client import MCPClient
-from pysecur3.MCP import MCPGenericCommand
 from pysecur3.MCP import MCPSetState
 
-VERSION = "0.7.2"
+VERSION = "0.7.3"
 DEBUG = False
 
 CONFIG = os.getenv('BISECUR2MQTT_CONFIG', 'bisecur2mqtt.conf')
@@ -57,7 +55,6 @@ CMD_GET_STATE = 50
 CMD_SET_STATE = 51
 
 LOGFILE = config.get('logfile', 'bisecur2mqtt.log')
-# LOGFORMAT = '%(asctime)-15s %(funcName).10s %(message)s'
 LOGFORMAT = "%(asctime)10s [%(filename)s:%(lineno)3s]  %(message)s [%(funcName)s()]"
 
 if DEBUG:
@@ -68,7 +65,6 @@ else:
 stderrLogger = log.StreamHandler()
 stderrLogger.setFormatter(log.Formatter(LOGFORMAT))
 log.getLogger().addHandler(stderrLogger)
-
 log.info("Starting")
 log.debug("DEBUG MODE")
 
@@ -98,19 +94,13 @@ def do_command(cmd, set_door=None):
             resp = init_bisecur_gw(True)
 
         else:
-            resp = (f"Command '{cmd} is not recognised")
-
+            resp = f"Command '{cmd} is not recognised"
         check_mcp_error(resp)
         publish_to_mqtt(f"{MQTT_COMMAND_SUBTOPIC}/{set_door}/response", resp)
-
     except Exception as ex:
         log.error(ex)
-
         traceback.print_exc()
         check_mcp_error(resp)
-        # msg = str(ex)
-        # log.error("Restarting Gateway...")
-        # init_bisecur_gw(True)
 
 
 def publish_to_mqtt(topic, payload, topic_base=MQTT_TOPIC_BASE, qos=MQTT_QOS, retain=False, ts_only=False):
@@ -251,7 +241,6 @@ def do_door_action(action, set_door):
     global LAST_DOOR_STATE
     value = None
     if action == "stop":
-        # Do reverse action to stop current direction
         if LAST_DOOR_STATE == "opening":
             action = "down"
         elif LAST_DOOR_STATE == "closing":
@@ -325,7 +314,7 @@ def check_mcp_error(resp):
 
     elif resp and hasattr(resp, "resp.payload") and hasattr(resp,
                                                             "resp.payload.command_id") and resp.payload.command_id == 1 and hasattr(
-            resp.payload.command, "error_code"):
+        resp.payload.command, "error_code"):
         log.error(
             f"MCP error '{resp.payload.command.error_code.value}' occurred (code: {resp.payload.command.error_code.name}) ")
         # Error 12 is Permission Denied
@@ -337,7 +326,6 @@ def check_mcp_error(resp):
 
     else:
         publish_to_mqtt(f"{MQTT_COMMAND_SUBTOPIC}/error", "")
-        # CLI.last_error = None
         return None
 
 
@@ -359,6 +347,7 @@ def on_connect(mosq, userdata, flags, result_code):
         MQTT_CLIENT_SUB.subscribe(sub_topic, MQTT_QOS)
         publish_to_mqtt(f"{set_door}/state", "online")
         init_ha_discovery(set_door)
+
 
 def on_disconnect(mosq, userdata, rc):
     log.info("MQTT session disconnected")
@@ -406,11 +395,8 @@ def init_bisecur_gw(is_restart=False):
     if not (bisecur_ip and bisecur_mac):
         log.error("ERROR: bisecur Gateway IP and MAC addresses must be specified in the config file")
         sys.exit(2)
-
     log.debug(f"INIT: Gateway IP: {bisecur_ip}, bisecur_mac: {bisecur_mac}, src_mac: {src_mac}")
-
     CLI = MCPClient(bisecur_ip, 4000, bytes.fromhex(src_mac), bytes.fromhex(bisecur_mac))
-
     login_token = do_gw_login()
     if not login_token:
         sys.exit(2)
@@ -424,7 +410,6 @@ if __name__ == '__main__':
     }
 
     clientid = config.get('mqtt_client_id', 'biscure2mqtt-{}'.format(os.getpid()))
-    # initialise MQTT broker connection. Use separate clients for sub and pub, as loop_start/forever are blocking
     MQTT_CLIENT_SUB = paho.Client(f"{clientid}_sub", clean_session=False)
     MQTT_CLIENT_PUB = paho.Client(f"{clientid}_pub", clean_session=False)
 
@@ -470,7 +455,6 @@ if __name__ == '__main__':
             MQTT_CLIENT_SUB.loop_stop()
             if CLI:
                 if hasattr(CLI, "last_error") and CLI.last_error is not None and "value" in CLI.last_error and CLI.last_error.value == 12:
-                    # Permission denined error (12) seems to make the system hang on receive
                     log.info(f"Logging out of Bisecur Gateway ({CLI.token})")
                     CLI.logout()
                 elif hasattr(CLI, "last_error"):
